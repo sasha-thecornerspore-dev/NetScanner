@@ -8,6 +8,7 @@ import HostDetailsTab from './components/HostDetailsTab.jsx'
 import AiAnalysisTab from './components/AiAnalysisTab.jsx'
 import StatusBar from './components/StatusBar.jsx'
 import SettingsModal from './components/SettingsModal.jsx'
+import CopilotPanel from './components/CopilotPanel.jsx'
 
 // ─── Default scan profiles ──────────────────────────────────────────────────
 const BUILTIN_PROFILES = [
@@ -39,6 +40,7 @@ export default function App() {
     const [showSettings, setShowSettings] = useState(false)
     const [userProfiles, setUserProfiles] = useState([])
     const [elapsed, setElapsed] = useState(0)
+    const [copilotOpen, setCopilotOpen] = useState(false)
     const scanIdRef = useRef(null)
     const timerRef = useRef(null)
     const esRef = useRef(null)
@@ -186,6 +188,8 @@ export default function App() {
                 onAiAnalyze={runAiAnalysis}
                 hostsFound={hosts.length}
                 onSettings={() => setShowSettings(true)}
+                onCopilot={() => setCopilotOpen(c => !c)}
+                copilotOpen={copilotOpen}
             />
 
             <HostSidebar
@@ -244,6 +248,16 @@ export default function App() {
                     setUserProfiles={setUserProfiles}
                 />
             )}
+
+            <CopilotPanel
+                isOpen={copilotOpen}
+                onClose={() => setCopilotOpen(false)}
+                scanContext={{ hosts, target, command }}
+                onHostsDiscovered={(newHosts, cmd) => {
+                    setHosts(newHosts)
+                    if (newHosts.length > 0) setSelectedHost(newHosts[0])
+                }}
+            />
         </div>
     )
 }

@@ -1,9 +1,10 @@
-import { Wifi, Square, Play, Settings, Sparkles, AlertTriangle, CheckCircle } from 'lucide-react'
+import { Wifi, Square, Play, Settings, Sparkles, AlertTriangle, CheckCircle, Bot } from 'lucide-react'
 
 export default function Toolbar({
     target, setTarget, profile, setProfile, allProfiles,
     command, setCommand, scanning, nmapOk,
-    onScan, onStop, onAiAnalyze, hostsFound, onSettings
+    onScan, onStop, onAiAnalyze, hostsFound, onSettings,
+    onCopilot, copilotOpen
 }) {
     const handleProfileChange = e => {
         const sel = allProfiles.find(p => p.id === e.target.value)
@@ -85,6 +86,15 @@ export default function Toolbar({
                 title={hostsFound ? 'Run AI analysis on scan results' : 'Run a scan first'}
             >
                 <Sparkles size={12} /> AI Analyze
+            </button>
+
+            {/* AI Copilot */}
+            <button
+                className={`btn btn-copilot ${copilotOpen ? 'active' : ''}`}
+                onClick={onCopilot}
+                title="AI Copilot — conversational network exploration"
+            >
+                <Bot size={13} /> Copilot
             </button>
 
             {/* Settings */}

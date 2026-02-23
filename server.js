@@ -346,4 +346,257 @@ function parseNmapHosts(result) {
     return hosts;
 }
 
+// ── AI Copilot ────────────────────────────────────────────────────────────────
+// The copilot translates plain-language requests into nmap actions and executes them.
+app.post('/api/copilot', async (req, res) => {
+    const { message, history, scanContext } = req.body;
+    const settings = JSON.parse(await fs.readFile(SETTINGS_FILE, 'utf8'));
+    const apiKey = settings.geminiKey;
+    const nmapBin = settings.nmapPath || 'nmap';
+
+    if (!apiKey) return res.status(400).json({ error: 'Gemini API key not configured. Go to Settings to add it.' });
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    const send = (type, data) => res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
+
+    // Build conversation history for Gemini
+    const systemPrompt = `You are an expert network security AI copilot embedded in NetScanner AI, a Zenmap-like network reconnaissance tool. You help users explore networks by translating their plain-language requests into nmap commands and executing them.
+
+Your capabilities:
+1. **run_nmap_scan** — Execute any nmap scan by specifying target and arguments
+2. **analyze_results** — Provide security analysis of scan results
+3. **explain_service** — Explain what a network service/port does and its security implications
+
+Rules:
+- When a user asks to scan something, ALWAYS use the run_nmap_scan function. Do NOT just describe what command to run.
+- Be proactive: after showing scan results, suggest follow-up scans (e.g., "I noticed SSH on port 22 — want me to check for known vulnerabilities?")
+- Keep responses concise but informative
+- When explaining results, highlight security concerns first
+- If the user's request is ambiguous about the target, ask for clarification
+- You can run multiple scans in sequence if needed for complex requests
+
+Current session context:
+${scanContext ? `Previously scanned hosts: ${JSON.stringify(scanContext.hosts || [])}
+Last target: ${scanContext.target || 'none'}
+Last command: ${scanContext.command || 'none'}` : 'No previous scans in this session.'}`;
+
+    const geminiHistory = [
+        { role: 'user', parts: [{ text: systemPrompt }] },
+        { role: 'model', parts: [{ text: 'Understood. I\'m your network security copilot. I can run scans, analyze results, and help you explore your network. What would you like to do?' }] },
+    ];
+
+    // Add conversation history
+    if (history && Array.isArray(history)) {
+        for (const msg of history) {
+            geminiHistory.push({
+                role: msg.role === 'user' ? 'user' : 'model',
+                parts: [{ text: msg.content }]
+            });
+        }
+    }
+
+    // Add the new user message
+    geminiHistory.push({ role: 'user', parts: [{ text: message }] });
+
+    // Define function declarations for Gemini
+    const tools = [{
+        functionDeclarations: [
+            {
+                name: 'run_nmap_scan',
+                description: 'Execute an nmap network scan against a target. Use this whenever the user asks to scan, probe, check, or explore a network target.',
+                parameters: {
+                    type: 'OBJECT',
+                    properties: {
+                        target: {
+                            type: 'STRING',
+                            description: 'The target to scan (IP address, hostname, CIDR range, e.g., "192.168.1.0/24", "scanme.nmap.org", "localhost")'
+                        },
+                        args: {
+                            type: 'STRING',
+                            description: 'Nmap arguments/flags (e.g., "-T4 -F" for quick scan, "-sV" for version detection, "-sV --script=vuln" for vulnerability scan, "-O" for OS detection, "-p 80,443" for specific ports). Do NOT include the target here.'
+                        },
+                        explanation: {
+                            type: 'STRING',
+                            description: 'Brief explanation of what this scan will do, shown to the user before execution'
+                        }
+                    },
+                    required: ['target', 'args', 'explanation']
+                }
+            },
+            {
+                name: 'explain_service',
+                description: 'Explain what a network service or port does and its security implications',
+                parameters: {
+                    type: 'OBJECT',
+                    properties: {
+                        port: { type: 'INTEGER', description: 'Port number' },
+                        service: { type: 'STRING', description: 'Service name' },
+                        product: { type: 'STRING', description: 'Product/version info if available' }
+                    },
+                    required: ['port', 'service']
+                }
+            }
+        ]
+    }];
+
+    try {
+        // Call Gemini with function calling
+        const geminiResp = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    contents: geminiHistory,
+                    tools,
+                    generationConfig: { temperature: 0.3, maxOutputTokens: 4096 }
+                })
+            }
+        );
+
+        if (!geminiResp.ok) {
+            const err = await geminiResp.text();
+            send('error', { message: `Gemini API error: ${err}` });
+            return res.end();
+        }
+
+        const geminiData = await geminiResp.json();
+        const candidate = geminiData.candidates?.[0];
+        const parts = candidate?.content?.parts || [];
+
+        // Check if Gemini wants to call a function
+        const functionCall = parts.find(p => p.functionCall);
+        const textPart = parts.find(p => p.text);
+
+        if (functionCall) {
+            const { name, args } = functionCall.functionCall;
+
+            if (name === 'run_nmap_scan') {
+                const { target, args: nmapArgs, explanation } = args;
+
+                // Tell the user what we're doing
+                send('thinking', { text: explanation });
+                send('command', { command: `nmap ${nmapArgs} ${target}`, target, args: nmapArgs });
+
+                // Actually run the nmap scan
+                const scanArgs = nmapArgs.trim().split(/\s+/).concat(['-oX', '-', target]);
+                const proc = spawn(nmapBin, scanArgs, { shell: false });
+
+                let xmlOutput = '';
+                let textOutput = '';
+
+                proc.stdout.on('data', chunk => {
+                    const str = chunk.toString();
+                    xmlOutput += str;
+                    for (const line of str.split('\n')) {
+                        const trimmed = line.trim();
+                        if (trimmed && !trimmed.startsWith('<?xml') && !trimmed.startsWith('<') && !trimmed.startsWith('>')) {
+                            textOutput += line + '\n';
+                            send('scan_output', { line });
+                        }
+                    }
+                });
+
+                proc.stderr.on('data', chunk => {
+                    const str = chunk.toString();
+                    textOutput += str;
+                    for (const line of str.split('\n')) {
+                        if (line.trim()) send('scan_output', { line });
+                    }
+                });
+
+                proc.on('close', async (code) => {
+                    send('scan_done', { code });
+
+                    // Parse results
+                    let hosts = [];
+                    try {
+                        const xmlStart = xmlOutput.indexOf('<?xml');
+                        if (xmlStart !== -1) {
+                            const result = await parseStringPromise(xmlOutput.substring(xmlStart));
+                            hosts = parseNmapHosts(result);
+                        }
+                    } catch (e) { console.error('Copilot XML parse:', e.message); }
+
+                    send('scan_hosts', { hosts });
+
+                    // Now ask Gemini to interpret the results
+                    const interpretHistory = [...geminiHistory, {
+                        role: 'model',
+                        parts: [{ functionCall: functionCall.functionCall }]
+                    }, {
+                        role: 'user',
+                        parts: [{ functionResponse: {
+                            name: 'run_nmap_scan',
+                            response: {
+                                scanComplete: true,
+                                exitCode: code,
+                                hostsFound: hosts.length,
+                                hosts: hosts,
+                                rawOutput: textOutput.slice(0, 3000)
+                            }
+                        }}]
+                    }];
+
+                    try {
+                        const interpretResp = await fetch(
+                            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+                            {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    contents: interpretHistory,
+                                    generationConfig: { temperature: 0.3, maxOutputTokens: 4096 }
+                                })
+                            }
+                        );
+
+                        if (interpretResp.ok) {
+                            const iData = await interpretResp.json();
+                            const iText = iData.candidates?.[0]?.content?.parts?.[0]?.text || 'Scan complete.';
+                            send('response', { text: iText, hosts });
+                        } else {
+                            send('response', { text: `Scan complete. Found ${hosts.length} host(s).`, hosts });
+                        }
+                    } catch (e) {
+                        send('response', { text: `Scan complete. Found ${hosts.length} host(s). (AI interpretation unavailable)`, hosts });
+                    }
+
+                    res.end();
+                });
+
+                proc.on('error', err => {
+                    send('error', { message: `Nmap error: ${err.message}. Is nmap installed and in PATH?` });
+                    res.end();
+                });
+
+                req.on('close', () => { if (proc && !proc.killed) proc.kill(); });
+                return; // Don't end response — the scan process will end it
+
+            } else if (name === 'explain_service') {
+                // For explain_service, we just return the text that Gemini would have generated
+                send('response', { text: textPart?.text || `Port ${args.port} (${args.service}): This is a well-known service.` });
+                res.end();
+                return;
+            }
+        }
+
+        // No function call — just a text response
+        if (textPart) {
+            send('response', { text: textPart.text });
+        } else {
+            send('response', { text: 'I\'m not sure how to help with that. Try asking me to scan a target or analyze your network!' });
+        }
+        res.end();
+
+    } catch (e) {
+        send('error', { message: e.message });
+        res.end();
+    }
+});
+
 app.listen(PORT, () => console.log(`NetScanner API running on http://localhost:${PORT}`));
